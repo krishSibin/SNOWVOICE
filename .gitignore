@@ -1,0 +1,42 @@
+# --- Secrets ------------------------------------------------------------------
+# Real settings, passwords and keys. Only the empty template is committed.
+.env
+.env.*
+!.env.example
+
+# --- Python -------------------------------------------------------------------
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# --- Test and tool caches -----------------------------------------------------
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# --- Evaluation output ----------------------------------------------------------
+# Generated per run, and names real ticket numbers.
+eval/dataset.json
+eval/reports/
+
+# --- Local app data and speech models ---------------------------------------
+# Users, chat transcripts and agent run history; downloaded model weights.
+data/
+models/
+
+# --- Logs ---------------------------------------------------------------------
+*.log
+
+# --- Editors and OS -----------------------------------------------------------
+.vscode/
+.idea/
+.claude/
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,46 @@
+[project]
+name = "sn-agent"
+version = "0.1.0"
+description = "ServiceNow ticket resolution agent: researches ticket history, cites its evidence, scores its own confidence."
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.50",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.2",
+    "httpx>=0.27",
+    "truststore>=0.9",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "opentelemetry-api>=1.24",
+    "opentelemetry-sdk>=1.24",
+    # web app: login form and LiveKit room tokens
+    "python-multipart>=0.0.9",
+    "livekit-api>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+# The voice worker. Speech runs on local, free models: no external API.
+voice = [
+    "livekit-agents[openai,silero,turn-detector]>=1.8,<2",
+    "faster-whisper>=1.1",
+    "kokoro-onnx>=0.4",
+    "numpy>=1.26",
+]
+
+[project.scripts]
+sn-agent = "sn_agent.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+sn_agent = ["web/pages/*.html", "web/static/*", "web/static/vendor/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
