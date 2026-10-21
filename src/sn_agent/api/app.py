@@ -30,10 +30,18 @@ runner = JobRunner(
 @asynccontextmanager
 async def lifespan(_app: FastAPI):  # pragma: no cover - server lifecycle
     settings = get_settings()
+    sweeper = Sweeper(runner, settings, lambda: ServiceNowClient(settings)) if settings.sweep_enabled else None
+    monitor = None
+    if settings.record_agent_runs:
+        from ..monitor import AgentMonitor
+
+        monitor = AgentMonitor(runner, settings, sweeper, mode="webhook").start()
     runner.start()
-    if settings.sweep_enabled:
-        Sweeper(runner, settings, lambda: ServiceNowClient(settings)).start()
+    if sweeper is not None:
+        sweeper.start()
     yield
+    if monitor is not None:
+        monitor.stop()
 
 
 app = FastAPI(title="ServiceNow Resolution Agent", lifespan=lifespan)

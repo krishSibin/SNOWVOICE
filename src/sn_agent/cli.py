@@ -12,6 +12,13 @@ log = logging.getLogger("sn_agent")
 
 
 def main(argv: list[str] | None = None) -> int:
+    # A Windows terminal or pipe in cp1252 cannot print every character a note
+    # may hold; show a "?" instead of crashing after the work is done.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     parser = argparse.ArgumentParser(
         prog="sn-agent", description="ServiceNow ticket resolution agent and help desk assistant"
     )
@@ -75,6 +82,17 @@ def main(argv: list[str] | None = None) -> int:
     remove = users_sub.add_parser("remove", help="remove a login")
     remove.add_argument("email")
 
+    index = sub.add_parser("index", help="the local copy of resolved tickets used by KNOWLEDGE_SOURCE=index", parents=[common])
+    index_sub = index.add_subparsers(dest="action", required=True)
+    sync = index_sub.add_parser("sync", help="copy resolved tickets in; after the first run, only what changed")
+    sync.add_argument("--full", action="store_true", help="re-read everything, not just what changed")
+    sync.add_argument("--days", type=int, default=None, help="how far back a full read goes (default: SEARCH_RECENCY_DAYS)")
+    sync.add_argument("--watch", type=float, default=0, metavar="MINUTES", help="keep syncing every MINUTES")
+    index_sub.add_parser("status", help="how many tickets are indexed, and when it last synced")
+    find = index_sub.add_parser("search", help="try a search against the index")
+    find.add_argument("text")
+    find.add_argument("--limit", type=int, default=8)
+
     args = parser.parse_args(argv)
     if args.command == "voice":
         # LiveKit's CLI sets up its own logging and worker processes.
@@ -95,6 +113,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "users":
         return _users(args, settings)
+    if args.command == "index":
+        return _index(args, settings)
 
     if args.command == "resolve":
         from .factory import build_service
@@ -180,6 +200,57 @@ def _intake(args, settings) -> int:
     return 0
 
 
+def _index(args, settings) -> int:
+    from .sources.ticket_index import TicketIndex
+
+    index = TicketIndex(settings.app_db_path)
+    if args.action == "status":
+        stats = index.stats()
+        print(f"{stats['tickets']} ticket(s) indexed in {settings.app_db_path}")
+        print(f"  by table: {stats['by_table'] or '-'}")
+        print(f"  by resolution: {stats['by_level'] or '-'}  (rich = a fix is written down)")
+        if stats["unchecked"]:
+            print(f"  {stats['unchecked']} still to be checked by the model on the next sync")
+        print(f"  last sync: {stats['last_sync'] or 'never'}")
+        print(f"  KNOWLEDGE_SOURCE={settings.knowledge_source}")
+        return 0
+    if args.action == "search":
+        keys = index.search_text(args.text, limit=args.limit)
+        if not keys:
+            print("no matches")
+        for key in keys:
+            ticket, level = index.load([key])[key]
+            print(f"{ticket.number:12} {level.value:5} {ticket.short_description[:70]}")
+            if ticket.resolution_text:
+                print(f"{'':18}fix: {ticket.resolution_text.splitlines()[0][:80]}")
+        return 0
+
+    import time
+
+    from .intake.evidence import HumanNotesOnly
+    from .llm import TcsGenAiLLM
+    from .servicenow.client import ServiceNowClient
+    from .sources.ticket_index import sync_index
+
+    client = HumanNotesOnly(
+        ServiceNowClient(settings), [a for a in settings.intake_agent_note_authors.split(",") if a.strip()]
+    )
+    llm = TcsGenAiLLM(settings) if settings.tcs_genai_api_key.get_secret_value() else None
+    if llm is None:
+        log.warning("no LLM key set: unclear tickets get the safe rule-based level until a later sync")
+    full = args.full
+    while True:
+        report = sync_index(index, client, settings, llm, full=full, days=args.days)
+        print(
+            f"stored {report.stored}, removed {report.removed} (reopened), "
+            f"rechecked {report.rechecked}; {index.count()} ticket(s) in the index"
+        )
+        if not args.watch:
+            return 0
+        full = False
+        time.sleep(args.watch * 60)
+
+
 def _users(args, settings) -> int:
     import getpass
 
@@ -220,8 +291,15 @@ def _run_without_webhook(settings) -> int:
     from .sweep import Sweeper
 
     runner = JobRunner(workers=settings.worker_threads, max_failures=settings.max_failures_per_ticket)
+    sweeper = Sweeper(runner, settings, lambda: ServiceNowClient(settings))
+    monitor = None
+    if settings.record_agent_runs:
+        from .monitor import AgentMonitor
+
+        # Before the workers start, so their first lines reach the live log too.
+        monitor = AgentMonitor(runner, settings, sweeper).start()
     runner.start()
-    Sweeper(runner, settings, lambda: ServiceNowClient(settings)).start()
+    sweeper.start()
     print(
         f"Running: {settings.worker_threads} workers, sweep every {settings.sweep_interval_minutes:g} min "
         f"over the last {settings.sweep_window_days} days. No port is open. Ctrl+C to stop."
@@ -230,6 +308,8 @@ def _run_without_webhook(settings) -> int:
         while True:
             time.sleep(3600)
     except KeyboardInterrupt:
+        if monitor is not None:
+            monitor.stop()
         print("Stopped.")
     return 0
 

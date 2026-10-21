@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import sys
 import time
 from collections import deque
 
@@ -179,6 +180,10 @@ class WhisperSTT(stt.STT):
                     device = "cpu"
             except Exception:  # noqa: BLE001
                 device = "cpu"
+        if device == "cuda" and not _cuda_libraries_present():
+            # A GPU without the CUDA libraries loads the model fine and then
+            # fails or hangs on the first phrase, so nothing is heard all call.
+            device, compute = "cpu", "int8"
         self._model, model = _load_whisper(WhisperModel, model, device, compute)
         self._language = language
         # One transcription at a time per process: whisper already uses every core.
@@ -257,6 +262,25 @@ def trust_system_certificates() -> None:
         truststore.inject_into_ssl()
     except ImportError:  # pragma: no cover - truststore is a declared dependency
         pass
+
+
+def _cuda_libraries_present() -> bool:
+    """Whether the CUDA runtime whisper needs on the GPU can be loaded. Checked
+    by loading the DLL itself, which fails at once, rather than by a test
+    transcription, which can hang."""
+
+    if sys.platform != "win32":
+        return True
+    import ctypes
+
+    try:
+        # winmode=0: search PATH, where CUDA installs itself and where whisper
+        # looks. Python's default leaves PATH out and would miss a working GPU.
+        ctypes.WinDLL("cublas64_12.dll", winmode=0)
+        return True
+    except OSError:
+        log.warning("whisper cannot use the GPU: cublas64_12.dll (CUDA 12) is not installed; using the CPU")
+        return False
 
 
 def _load_whisper(whisper_model, name: str, device: str, compute: str):

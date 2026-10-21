@@ -81,6 +81,11 @@ class Settings(BaseSettings):
     max_candidate_tickets: int = 12
     chunk_max_chars: int = 1500
     search_recency_days: int = 1095
+    # Where past tickets are searched. "live" asks ServiceNow on every search;
+    # "index" uses the local copy `sn-agent index sync` keeps in APP_DB_PATH,
+    # which is faster and matches by any word; "hybrid" uses the index and
+    # falls back to live when it finds nothing. Open tickets are always live.
+    knowledge_source: Literal["live", "index", "hybrid"] = "live"
 
     # Open-ticket detection
     open_ticket_window_days: int = 14
@@ -131,6 +136,13 @@ class Settings(BaseSettings):
     # Web app: the end-user chatbot page and the ops console.
     app_db_path: str = "data/sn_agent.db"
     app_secret_key: SecretStr = SecretStr("")
+    # One standing login per role, created (or its password reset) at startup
+    # so a fresh database can be signed in to straight away. Leave blank to
+    # manage logins only with `sn-agent users`.
+    app_user_email: str = ""
+    app_user_password: SecretStr = SecretStr("")
+    app_admin_email: str = ""
+    app_admin_password: SecretStr = SecretStr("")
     record_agent_runs: bool = True
 
     # LiveKit. The defaults match `livekit-server --dev` on this machine.
@@ -157,6 +169,13 @@ class Settings(BaseSettings):
     noise_gate_min_db: float = -45.0  # audio quieter than this never counts
     noise_gate_margin_db: float = 12.0  # how far above the room's background speech must be
     noise_gate_relative_db: float = 15.0  # mute what is this far below the caller's own voice
+    # How sure the voice detector must be that a sound is speech before a turn
+    # starts (0-1). 0.7 ignores office chatter; lower it (e.g. 0.5) if a quiet
+    # speaker's own voice is not picked up.
+    vad_activation_threshold: float = 0.7
+    # Seconds the voice agent waits for the model to start answering before it
+    # retries. Raise it if the gateway is slow to start answering.
+    voice_llm_timeout_s: float = 10.0
 
     # Queue and sweep. ServiceNow is the queue: the sweep asks it which open
     # tickets still lack an agent note, and workers take them most urgent first.

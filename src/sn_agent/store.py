@@ -60,6 +60,25 @@ CREATE TABLE IF NOT EXISTS agent_steps (
     message TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS agent_steps_ticket ON agent_steps (ticket_number, at);
+-- What `sn-agent serve` is doing right now, rewritten every few seconds.
+CREATE TABLE IF NOT EXISTS agent_status (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    heartbeat_at REAL NOT NULL,
+    data TEXT NOT NULL DEFAULT '{}'
+);
+-- Every ticket a worker finished, including the ones that failed.
+CREATE TABLE IF NOT EXISTS agent_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket_number TEXT NOT NULL,
+    at REAL NOT NULL,
+    status TEXT NOT NULL,
+    priority INTEGER,
+    outcome TEXT NOT NULL DEFAULT '',
+    confidence REAL,
+    cost_usd REAL,
+    detail TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS agent_jobs_at ON agent_jobs (at);
 """
 
 # Conversation outcomes. "solved" is the one the dashboard counts as deflected.
@@ -217,6 +236,53 @@ class Store:
                 "INSERT INTO agent_steps (ticket_number, at, level, message) VALUES (?, ?, ?, ?)",
                 (ticket_number, at or time.time(), level, message),
             )
+
+    def steps_after(self, after_id: int = 0, *, limit: int = 300) -> list[dict[str, Any]]:
+        """Log lines newer than `after_id`, oldest first. With no id, the latest `limit`."""
+
+        if after_id:
+            return self._all(
+                "SELECT id, ticket_number, at, level, message FROM agent_steps WHERE id > ? ORDER BY id LIMIT ?",
+                (after_id, limit),
+            )
+        rows = self._all(
+            "SELECT id, ticket_number, at, level, message FROM agent_steps ORDER BY id DESC LIMIT ?", (limit,)
+        )
+        return rows[::-1]
+
+    # --- the running agent --------------------------------------------------
+
+    def put_agent_status(self, data: dict[str, Any]) -> None:
+        with self._tx() as cur:
+            cur.execute(
+                "INSERT INTO agent_status (id, heartbeat_at, data) VALUES (1, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET heartbeat_at = excluded.heartbeat_at, data = excluded.data",
+                (time.time(), json.dumps(data)),
+            )
+
+    def get_agent_status(self) -> dict[str, Any] | None:
+        row = self._one("SELECT heartbeat_at, data FROM agent_status WHERE id = 1")
+        if not row:
+            return None
+        return {**json.loads(row["data"]), "heartbeat_at": row["heartbeat_at"]}
+
+    def add_job(self, job: dict[str, Any]) -> None:
+        with self._tx() as cur:
+            cur.execute(
+                "INSERT INTO agent_jobs (ticket_number, at, status, priority, outcome, confidence, cost_usd, detail) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    job["number"], job.get("at") or time.time(), job["status"], job.get("priority"),
+                    job.get("outcome") or "", job.get("confidence"), job.get("cost_usd"), job.get("detail") or "",
+                ),
+            )
+
+    def job_counts(self, since: float = 0.0) -> dict[str, int]:
+        rows = self._all("SELECT status, COUNT(*) AS n FROM agent_jobs WHERE at >= ? GROUP BY status", (since,))
+        return {r["status"]: r["n"] for r in rows}
+
+    def recent_jobs(self, limit: int = 20) -> list[dict[str, Any]]:
+        return self._all("SELECT * FROM agent_jobs ORDER BY id DESC LIMIT ?", (limit,))
 
     # --- dashboard ----------------------------------------------------------
 

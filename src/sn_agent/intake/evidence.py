@@ -185,9 +185,12 @@ class FixStep:
 
 @dataclass
 class FixSearch:
-    status: str  # fix_found | no_documented_fix | no_history
+    # fix_found: steps the user can do | fix_needs_technician: fixed before, but
+    # only IT can do it | no_documented_fix | no_history
+    status: str
     steps: list[FixStep] = field(default_factory=list)
     cause: str = ""
+    fixed_before: list[str] = field(default_factory=list)
     similar_without_fix: list[str] = field(default_factory=list)
     open_now: list[str] = field(default_factory=list)
     major_incident: bool = False
@@ -209,8 +212,15 @@ class FixSearch:
             out["steps_needing_technician"] = sum(1 for s in self.steps if s.needs_technician)
             if self.cause:
                 out["cause"] = self.cause
-            if not user_steps:
-                out["note"] = "Every documented fix needs a technician: offer to raise a ticket."
+        elif self.status == "fix_needs_technician":
+            out["fixed_before_in"] = self.fixed_before[:3]
+            if self.cause:
+                out["cause"] = self.cause
+            out["note"] = (
+                "This was fixed before, but by the IT team: the fix needs admin or server access, so give "
+                "the user no steps. Tell them it has been seen and fixed before (say the cause if given), "
+                "and offer to raise a ticket so IT can apply the same fix."
+            )
         elif self.status == "no_documented_fix":
             out["note"] = (
                 "The same issue happened before but nobody recorded how it was fixed. "
@@ -293,11 +303,21 @@ class FixFinder:
         draft = self._draft(issue, bucket_a, meter)
         steps = self._verify(draft, bucket_a, meter)
         timings["draft_s"] = round(time.time() - mark, 2)
-        if steps:
+        if any(not step.needs_technician for step in steps):
             result.status = "fix_found"
             result.steps = steps
             result.cause = draft.cause.strip()
+        elif steps or not draft.steps:
+            # The tickets carry a documented fix, but nothing in it is for the
+            # user: a server, a certificate, admin rights. That is not "nobody
+            # wrote it down"; the IT team knows the fix, so the ticket says so.
+            result.status = "fix_needs_technician"
+            result.steps = steps
+            result.cause = draft.cause.strip()
+            result.fixed_before = [c.number for c in bucket_a]
         else:
+            # Steps were drafted but none survived the citation check: what the
+            # fix was is not certain, so nothing is claimed about it.
             result.status = "no_documented_fix"
             result.similar_without_fix = [c.number for c in bucket_a] + result.similar_without_fix
         timings["total_s"] = round(time.time() - started, 2)

@@ -39,13 +39,16 @@ def fix_handler(*, technician: bool = False):
     return handle
 
 
-def build(history=(), *, grades: dict, support: str = "supported", technician: bool = False, cfg=None, open_tickets=()):
+def build(
+    history=(), *, grades: dict, support: str = "supported", technician: bool = False, cfg=None, open_tickets=(),
+    fix=None,
+):
     cfg = cfg or settings()
     llm = FakeLLM(
         {
             "intake_grade": grade_handler(grades),
             "resolution_level": level_handler,
-            "intake_fix": fix_handler(technician=technician),
+            "intake_fix": fix or fix_handler(technician=technician),
             "verify_support": support_handler(support),
         }
     )
@@ -115,10 +118,59 @@ def test_steps_needing_a_technician_are_withheld_from_the_user():
         technician=True,
     )
 
-    shown = finder.find(VPN_ISSUE).for_model()
+    result = finder.find(VPN_ISSUE)
+    shown = result.for_model()
 
-    assert shown["steps_for_user"] == []
-    assert shown["steps_needing_technician"] == 1
+    assert result.status == "fix_needs_technician"
+    assert "steps_for_user" not in shown
+    assert shown["fixed_before_in"] == ["INC0001"]
+
+
+def server_side_fix(prompt: str) -> UserFixDraft:
+    """What a model returns when the whole fix is on a server: the cause, no user steps."""
+
+    return UserFixDraft(cause="Expired gateway certificate", steps=[])
+
+
+def test_a_fix_only_it_can_do_is_reported_as_fixed_before_not_as_unrecorded():
+    """The VPN case: the past tickets say exactly how it was fixed (re-issue the
+    gateway certificate), but none of it is for an employee. That must not be
+    told to the user, or written in the ticket, as "no recorded fix"."""
+
+    finder, _llm, _ = build(
+        [make_ticket("INC0001", close_notes=VPN_FIX)], grades={"INC0001": ("relevant", 0.9, "unrelated")},
+        fix=server_side_fix,
+    )
+
+    result = finder.find(VPN_ISSUE)
+    shown = result.for_model()
+
+    assert result.status == "fix_needs_technician"
+    assert result.similar_without_fix == []
+    assert shown["fixed_before_in"] == ["INC0001"] and shown["cause"] == "Expired gateway certificate"
+    assert "nobody recorded" not in shown["note"] and "steps_for_user" not in shown
+
+
+def test_the_ticket_tells_it_the_known_fix():
+    finder, _llm, _ = build(
+        [make_ticket("INC0001", close_notes=VPN_FIX, assignment_group="Network Support")],
+        grades={"INC0001": ("relevant", 0.9, "unrelated")},
+        fix=server_side_fix,
+    )
+    session = make_session(finder)
+    session.add_message("user", "VPN gives error 809 and I can't work")
+    run(session.call_tool("search_past_fixes", {"summary": VPN_ISSUE.summary, "system": "VPN", "error_text": "809"}))
+    run(
+        session.call_tool(
+            "prepare_incident",
+            {"short_description": "VPN error 809", "details": "Cannot connect", "users_affected": "just_me", "work_impact": "cannot_work"},
+        )
+    )
+    run(session.call_tool("create_incident", {}))
+
+    description = session.incident.payload["description"]
+    assert "Fixed before in INC0001" in description and "Expired gateway certificate" in description
+    assert "no recorded fix" not in description
 
 
 def test_nothing_similar_means_no_history():

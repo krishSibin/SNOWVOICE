@@ -26,7 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from ..config import Settings, get_settings
 from ..recorder import open_store
 from ..store import Store
-from .auth import COOKIE, SESSION_SECONDS, Identity, Signer, check_password
+from .auth import COOKIE, SESSION_SECONDS, Identity, Signer, check_password, hash_password
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +59,22 @@ def configure(settings: Settings, *, store: Store | None = None, services: Any =
     state.signer = Signer(settings.app_secret_key.get_secret_value())
     state.services = services
     state.chats = {}
+    _seed_logins(settings, state.store)
+
+
+def _seed_logins(settings: Settings, store: Store) -> None:
+    """Create the user and admin logins named in .env, if any."""
+    for email, password, role, name in (
+        (settings.app_user_email, settings.app_user_password, "user", "User"),
+        (settings.app_admin_email, settings.app_admin_password, "ops", "Admin"),
+    ):
+        secret = password.get_secret_value()
+        if not email or not secret:
+            continue
+        existing = store.get_user(email)
+        if existing and existing["role"] == role and check_password(secret, existing["password_hash"]):
+            continue  # already there; skip the slow rehash
+        store.put_user(email, existing["name"] if existing else name, role, hash_password(secret))
 
 
 app = FastAPI(title="ServiceNow Agent", lifespan=lifespan)
@@ -113,13 +129,19 @@ def login_page():
 
 
 @app.post("/login")
-def login(email: str = Form(...), password: str = Form(...)):
+def login(email: str = Form(...), password: str = Form(...), portal: str = Form("user")):
+    # Two sign-in forms on one page: employees land on the chatbot, admins
+    # (the ops role) on the ops console. The admin form refuses other roles.
+    admin = portal == "admin"
+    failed = "/login?failed=1" + ("&portal=admin" if admin else "")
     user = state.store.get_user(email)
     if not user or not check_password(password, user["password_hash"]):
         time.sleep(0.5)  # slows guessing a little; not a substitute for a lockout
-        return RedirectResponse("/login?failed=1", status_code=303)
+        return RedirectResponse(failed, status_code=303)
     identity = Identity(email=user["email"], name=user["name"], role=user["role"])
-    response = RedirectResponse("/ops" if identity.is_ops else "/chat", status_code=303)
+    if admin and not identity.is_ops:
+        return RedirectResponse("/login?denied=1&portal=admin", status_code=303)
+    response = RedirectResponse("/ops" if admin else "/chat", status_code=303)
     response.set_cookie(
         COOKIE, state.signer.issue(identity), max_age=SESSION_SECONDS, httponly=True, samesite="lax"
     )
@@ -158,6 +180,16 @@ def me(identity: Identity = Depends(require_user)) -> dict[str, Any]:
 @app.get("/api/me/conversations")
 def my_conversations(identity: Identity = Depends(require_user)) -> list[dict[str, Any]]:
     return state.store.list_conversations(user_email=identity.email, limit=50)
+
+
+@app.get("/api/me/conversations/{conv_id}")
+def my_conversation(conv_id: str, identity: Identity = Depends(require_user)) -> dict[str, Any]:
+    # Someone else's conversation looks the same as a missing one.
+    conv = state.store.get_conversation(conv_id)
+    if conv is None or conv.get("user_email") != identity.email.lower().strip():
+        raise HTTPException(status_code=404)
+    keep = ("id", "channel", "started_at", "outcome", "summary", "incident_number")
+    return {**{k: conv.get(k) for k in keep}, "transcript": conv.get("transcript") or []}
 
 
 # --- voice and text through LiveKit ----------------------------------------
@@ -262,6 +294,42 @@ def end_chat(chat_id: str, identity: Identity = Depends(require_user)) -> dict[s
 @app.get("/api/ops/dashboard")
 def dashboard(days: int = 30, _ops: Identity = Depends(require_ops)) -> dict[str, Any]:
     return state.store.dashboard(days=max(1, min(days, 365)))
+
+
+# A heartbeat older than this means `serve` stopped or crashed.
+AGENT_STALE_S = 15.0
+
+
+@app.get("/api/ops/agent")
+def agent_live(after: int = 0, _ops: Identity = Depends(require_ops)) -> dict[str, Any]:
+    """The running ticket agent: its state, what it is working on, what is
+    still waiting for it, result counts, and the log lines after `after`."""
+
+    store = state.store
+    status = store.get_agent_status()
+    now = time.time()
+    if status:
+        age = now - status["heartbeat_at"]
+        alive = not status.get("stopped") and age < AGENT_STALE_S
+        runner = status.get("runner") or {}
+        sweep = status.get("sweep") or {}
+        if not alive:
+            phase = "stopped"
+        elif runner.get("working"):
+            phase = "working"
+        elif sweep.get("sweeping"):
+            phase = "sweeping"
+        else:
+            phase = "idle"
+        status.update(alive=alive, phase=phase, heartbeat_age_s=round(age, 1))
+    return {
+        "now": now,
+        "status": status,
+        "counts": {"day": store.job_counts(now - 86400), "all": store.job_counts()},
+        "recent": store.recent_jobs(20),
+        "log": store.steps_after(max(0, after), limit=300),
+        "instance_url": state.settings.servicenow_instance_url.rstrip("/"),
+    }
 
 
 @app.get("/api/ops/runs")

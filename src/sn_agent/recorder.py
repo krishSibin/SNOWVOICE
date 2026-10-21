@@ -52,15 +52,17 @@ class RecordingNotifier:
 
 class StepLog(logging.Handler):
     """Keeps INFO and above from the agent's loggers, for lines logged while a
-    ticket is being worked."""
+    ticket is being worked. With `untagged`, also the lines that belong to no
+    ticket (the sweep, the workers starting), for the live log of `serve`."""
 
-    def __init__(self, store: Store):
+    def __init__(self, store: Store, *, untagged: bool = False):
         super().__init__(level=logging.INFO)
         self.store = store
+        self.untagged = untagged
 
     def emit(self, record: logging.LogRecord) -> None:
         ticket = getattr(record, "ticket", "") or _current_ticket.get()
-        if not ticket or record.name.startswith("sn_agent.recorder"):
+        if (not ticket and not self.untagged) or record.name.startswith("sn_agent.recorder"):
             return
         try:
             self.store.add_step(ticket, record.levelname, record.getMessage(), at=record.created)
@@ -68,15 +70,19 @@ class StepLog(logging.Handler):
             pass
 
 
-_installed: set[str] = set()
+_installed: dict[object, StepLog] = {}
 _install_lock = threading.Lock()
 
 
-def install_step_log(store: Store) -> None:
-    """Idempotent: one handler per database, however many services are built."""
+def install_step_log(store: Store, *, untagged: bool = False) -> None:
+    """Idempotent: one handler per database, however many services are built.
+    Asking for `untagged` once keeps untagged lines from then on."""
 
+    # Every in-memory database is called ":memory:", but each is its own.
+    key: object = id(store) if store.path == ":memory:" else store.path
     with _install_lock:
-        if store.path in _installed:
-            return
-        logging.getLogger("sn_agent").addHandler(StepLog(store))
-        _installed.add(store.path)
+        handler = _installed.get(key)
+        if handler is None:
+            handler = _installed[key] = StepLog(store, untagged=untagged)
+            logging.getLogger("sn_agent").addHandler(handler)
+        handler.untagged = handler.untagged or untagged

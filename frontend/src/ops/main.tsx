@@ -5,6 +5,7 @@ import { createRoot } from "react-dom/client";
 import "../shared/styles.css";
 import { getJSON, when, type Me } from "../shared/api";
 import { Pill, TopBar, type Tone } from "../shared/ui";
+import { AgentTab } from "./AgentTab";
 import { BarChart } from "./BarChart";
 
 const OUTCOME_LABEL: Record<string, [string, Tone]> = {
@@ -421,6 +422,7 @@ function ConversationsTab({ open }: { open: (node: ReactNode) => void }) {
 // --- page ---------------------------------------------------------------------
 
 const TABS = [
+  ["agent", "Live agent"],
   ["dashboard", "Dashboard"],
   ["tickets", "Tickets answered"],
   ["conversations", "Chatbot conversations"],
@@ -429,7 +431,7 @@ type Tab = (typeof TABS)[number][0];
 
 function OpsPage() {
   const [me, setMe] = useState<Me | null>(null);
-  const [tab, setTab] = useState<Tab>("dashboard");
+  const [tab, setTab] = useState<Tab>("agent");
   const [drawer, setDrawer] = useState<ReactNode>(null);
 
   useEffect(() => {
@@ -439,7 +441,7 @@ function OpsPage() {
   if (!me) return null;
   return (
     <>
-      <TopBar brand="Ops console" who={me.name || me.email}>
+      <TopBar brand="❄ SNOW AGENT · Ops console" who={me.name || me.email}>
         <a href="/chat">Open the chatbot</a>
       </TopBar>
       <main className="ops">
@@ -450,6 +452,7 @@ function OpsPage() {
             </button>
           ))}
         </nav>
+        {tab === "agent" && <AgentTab />}
         {tab === "dashboard" && <DashboardTab />}
         {tab === "tickets" && <TicketsTab open={setDrawer} />}
         {tab === "conversations" && <ConversationsTab open={setDrawer} />}

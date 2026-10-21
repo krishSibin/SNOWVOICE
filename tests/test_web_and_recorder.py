@@ -24,8 +24,9 @@ def make_client(store: Store) -> TestClient:
     return TestClient(web.app)
 
 
-def login(client: TestClient, email: str, password: str):
-    return client.post("/login", data={"email": email, "password": password}, follow_redirects=False)
+def login(client: TestClient, email: str, password: str, portal: str = "user"):
+    data = {"email": email, "password": password, "portal": portal}
+    return client.post("/login", data=data, follow_redirects=False)
 
 
 def seeded_store() -> Store:
@@ -53,6 +54,10 @@ def test_an_employee_reaches_only_the_chatbot():
     client = make_client(seeded_store())
 
     assert login(client, "ana@example.com", "nope").headers["location"] == "/login?failed=1"
+    # The admin form turns an employee away, even with the right password.
+    denied = login(client, "ana@example.com", "employee-pass", portal="admin")
+    assert denied.headers["location"] == "/login?denied=1&portal=admin"
+    assert "set-cookie" not in denied.headers
     response = login(client, "ana@example.com", "employee-pass")
     assert response.headers["location"] == "/chat"
 
@@ -68,7 +73,7 @@ def test_ops_sees_the_console_and_everyones_conversations():
     store.save_conversation({"id": "c2", "user_email": "bo@example.com", "outcome": "ticket_raised", "priority": 3,
                              "assignment_group": "Network Support", "incident_number": "INC1"})
     client = make_client(store)
-    login(client, "ops@example.com", "ops-pass-123")
+    assert login(client, "ops@example.com", "ops-pass-123", portal="admin").headers["location"] == "/ops"
 
     assert client.get("/ops").status_code == 200
     assert {c["id"] for c in client.get("/api/ops/conversations").json()} == {"c1", "c2"}
@@ -84,6 +89,8 @@ def test_employees_see_only_their_own_conversations():
     login(client, "ana@example.com", "employee-pass")
 
     assert [c["id"] for c in client.get("/api/me/conversations").json()] == ["c1"]
+    assert client.get("/api/me/conversations/c1").json()["id"] == "c1"
+    assert client.get("/api/me/conversations/c2").status_code == 404
 
 
 def test_livekit_token_carries_who_is_calling():
@@ -136,3 +143,21 @@ def test_recorder_keeps_the_run_and_its_steps_for_the_console():
         "step 1: reading the ticket to extract the facts",
         "work note posted (run run-1)",
     ]
+
+
+def test_the_user_and_admin_logins_in_env_are_created_at_startup():
+    from pydantic import SecretStr
+
+    store = Store(":memory:")
+    settings = Settings(
+        app_secret_key="test-secret",
+        app_user_email="user@example.com",
+        app_user_password=SecretStr("user-pass"),
+        app_admin_email="admin@example.com",
+        app_admin_password=SecretStr("admin-pass"),
+    )
+    web.configure(settings, store=store)
+    client = TestClient(web.app)
+
+    assert login(client, "user@example.com", "user-pass").headers["location"] == "/chat"
+    assert login(client, "admin@example.com", "admin-pass", portal="admin").headers["location"] == "/ops"

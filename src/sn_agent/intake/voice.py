@@ -29,6 +29,7 @@ from typing import Literal
 from livekit.agents import (
     Agent,
     AgentSession,
+    APIConnectOptions,
     JobContext,
     JobProcess,
     RunContext,
@@ -38,6 +39,7 @@ from livekit.agents import (
     room_io,
 )
 from livekit.agents import tts as lk_tts
+from livekit.agents.voice.agent_session import SessionConnectOptions
 from livekit.agents.metrics import EOUMetrics, LLMMetrics, TTSMetrics
 from livekit.plugins import openai as lk_openai
 from livekit.plugins import silero
@@ -164,7 +166,8 @@ def prewarm(proc: JobProcess) -> None:
     # office, a stricter threshold and a 0.25 s minimum keep keyboard clicks,
     # coughs and voices across the room from counting as speech.
     proc.userdata["vad"] = silero.VAD.load(
-        min_silence_duration=0.45, min_speech_duration=0.25, activation_threshold=0.7
+        min_silence_duration=0.45, min_speech_duration=0.25,
+        activation_threshold=settings.vad_activation_threshold,
     )
     proc.userdata["stt"] = _stt(settings, proc.userdata["vad"])
     # Long sentences are spoken clause by clause, so the first words play sooner.
@@ -217,6 +220,9 @@ async def entrypoint(ctx: JobContext) -> None:
             "preemptive_generation": {"enabled": True, "preemptive_tts": True},
         },
         max_tool_steps=4,
+        # How long to wait for the model's first words before retrying
+        # (VOICE_LLM_TIMEOUT_S, LiveKit's own 10 s by default).
+        conn_options=SessionConnectOptions(llm_conn_options=APIConnectOptions(timeout=settings.voice_llm_timeout_s)),
     )
 
     @session.on("conversation_item_added")

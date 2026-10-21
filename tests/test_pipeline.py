@@ -388,3 +388,44 @@ def test_support_label_is_carried_into_the_note(support):
         assert "partly supported" in note
     else:
         assert "partly supported" not in note
+
+
+def test_waits_for_the_quota_when_every_model_is_rate_limited():
+    """Every model at its rate limit at once: wait for the quota, don't give up."""
+
+    import openai
+
+    from sn_agent.config import Settings
+    from sn_agent.llm import Meter, TcsGenAiLLM, Tier
+
+    calls: list[str] = []
+
+    class Completions:
+        def create(self, *, model, **_kw):
+            calls.append(model)
+            if len(calls) <= 2:
+                raise _api_status_error(openai.RateLimitError, 429, "quota")
+            return _fake_response('{"queries": ["vpn 809"]}')
+
+    class Chat:
+        completions = Completions()
+
+    class Client:
+        chat = Chat()
+
+    cfg = Settings(model_flash="flash", model_lite="lite", llm_max_retries=3)
+    llm = TcsGenAiLLM(cfg, client=Client())
+    waits: list[float] = []
+
+    def wait(seconds):
+        waits.append(seconds)
+        llm._cooling_until.clear()
+
+    llm._wait = wait
+    meter = Meter(cfg.prices, 10.0, 10**6)
+
+    llm.generate_json(tier=Tier.FLASH, system="s", prompt="p", schema=QueryPlan, meter=meter, step="plan")
+
+    assert calls == ["flash", "lite", "flash"]
+    assert len(waits) == 1 and 0 < waits[0] <= 61
+

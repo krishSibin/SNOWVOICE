@@ -9,13 +9,15 @@ from .notify.servicenow_note import ServiceNowWorkNoteNotifier
 from .servicenow.client import ServiceNowClient
 from .service import ResolutionService
 from .sources.servicenow_search import ServiceNowSearchSource
+from .sources.ticket_index import knowledge_source
 
 
 def build_service(settings: Settings | None = None, *, dry_run: bool = False) -> ResolutionService:
     settings = settings or get_settings()
     llm = TcsGenAiLLM(settings)
     client = ServiceNowClient(settings)
-    pipeline = ResolutionPipeline(settings, llm, ServiceNowSearchSource(client, settings, llm))
+    source = knowledge_source(settings, ServiceNowSearchSource(client, settings, llm))
+    pipeline = ResolutionPipeline(settings, llm, source)
     notifier = ServiceNowWorkNoteNotifier(client, dry_run=dry_run)
     if settings.record_agent_runs:
         # Observes the run for the ops console; the agent's behaviour is unchanged.

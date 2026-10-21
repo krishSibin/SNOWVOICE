@@ -182,16 +182,35 @@ class TcsGenAiLLM:
         self, *, tier: Tier, system: str, prompt: str, schema: type[T], meter: Meter, step: str = ""
     ) -> T:
         meter.ensure_available(step)
-        candidates = self.fallback_models(tier)
         last_error: Exception | None = None
-        for index, model in enumerate(candidates):
-            try:
-                return self._generate_with(model, system, prompt, schema, meter, step)
-            except LLMUnavailable as exc:
-                last_error = exc
-                if index + 1 < len(candidates):
-                    log.warning("%s unavailable for step=%s; falling back to %s", model, step, candidates[index + 1])
+        for round_ in range(self.settings.llm_max_retries + 1):
+            candidates = self.fallback_models(tier)
+            for index, model in enumerate(candidates):
+                try:
+                    return self._generate_with(model, system, prompt, schema, meter, step)
+                except LLMUnavailable as exc:
+                    last_error = exc
+                    if index + 1 < len(candidates):
+                        log.warning("%s unavailable for step=%s; falling back to %s", model, step, candidates[index + 1])
+            # Every model is at its per-minute quota at once: waiting for the
+            # quota to refill beats losing the ticket.
+            wait = self._quota_wait(tier)
+            if wait <= 0 or round_ == self.settings.llm_max_retries:
+                break
+            log.warning("every model is rate limited on step=%s; waiting %ds for the quota to refill", step, wait)
+            self._wait(wait)
+            meter.ensure_available(step)
         raise LLMUnavailable(f"{step}: no model available ({last_error})")
+
+    def _quota_wait(self, tier: Tier) -> int:
+        """Seconds until the first rate-limited model of this tier is usable
+        again, or 0 when some model failed for another reason."""
+
+        now = time.time()
+        chain = [m for m in self.fallback_models(tier) if m not in self._retired_models]
+        if not chain or any(self._cooling_until.get(m, 0) <= now for m in chain):
+            return 0
+        return max(1, int(min(self._cooling_until[m] for m in chain) - now) + 1)
 
     def _generate_with(
         self, model: str, system: str, prompt: str, schema: type[T], meter: Meter, step: str
@@ -289,6 +308,10 @@ class TcsGenAiLLM:
                 raise LLMOutputError(f"{step}: model returned unusable JSON: {text[:400]}") from exc
 
         raise LLMOutputError(f"{step}: exhausted retries") from last_error
+
+    @staticmethod
+    def _wait(seconds: float) -> None:  # pragma: no cover - timing
+        time.sleep(seconds)
 
     @staticmethod
     def _sleep(attempt: int) -> None:  # pragma: no cover - timing

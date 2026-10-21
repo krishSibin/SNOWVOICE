@@ -72,6 +72,12 @@ class FakeServiceNow:
                 matches.append(ticket)
         return [self._record(t) for t in matches[:limit]]
 
+    def query_records(self, table: str, query: str, **_kw):
+        """Every ticket on the table, as the index sync reads them."""
+
+        self.queries.append((table, query))
+        return [self._record(t) for t in self.tickets if t.table == table]
+
     def get_journal(self, table, sys_ids, elements=("work_notes", "comments")):
         wanted = set(sys_ids)
         return {t.sys_id: t.journal for t in self.tickets if t.sys_id in wanted}

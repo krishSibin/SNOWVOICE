@@ -34,7 +34,11 @@ class Pending:
     reason: str  # "new" or "ticket changed"
 
 
-def find_pending(client: ServiceNowClient, settings: Settings, *, table: str = "incident") -> list[Pending]:
+def find_pending(
+    client: ServiceNowClient, settings: Settings, *, table: str = "incident", stats: dict | None = None
+) -> list[Pending]:
+    """`stats`, if given, is filled with how many tickets were open and answered."""
+
     query = "^".join(
         [
             "active=true",
@@ -49,6 +53,8 @@ def find_pending(client: ServiceNowClient, settings: Settings, *, table: str = "
         client.to_ticket(record, table)
         for record in client.query_records(table, query, limit=settings.sweep_max_tickets)
     ]
+    if stats is not None:
+        stats.update(open=len(tickets), answered=0)
     if not tickets:
         log.info("sweep: no open tickets from the last %d day(s)", settings.sweep_window_days)
         return []
@@ -71,6 +77,8 @@ def find_pending(client: ServiceNowClient, settings: Settings, *, table: str = "
             )
         )
     pending.sort(key=lambda p: (p.priority, p.opened_at or datetime.max))
+    if stats is not None:
+        stats["answered"] = len(tickets) - len(pending)
     log.info(
         "sweep: %d open ticket(s) from the last %d day(s), %d already answered, %d need the agent%s",
         len(tickets),
@@ -98,6 +106,13 @@ class Sweeper:
         self.runner = runner
         self.settings = settings
         self.client_factory = client_factory
+        # The last sweep, for the ops console.
+        self.sweeping = False
+        self.last_at: float | None = None
+        self.next_at: float | None = None
+        self.last_error = ""
+        self.last_stats: dict = {}
+        self.pending: list[Pending] = []
 
     def start(self) -> None:
         threading.Thread(target=self._loop, name="sn-agent-sweeper", daemon=True).start()
@@ -105,8 +120,12 @@ class Sweeper:
     def _loop(self) -> None:  # pragma: no cover - timing loop
         client = self.client_factory()
         while True:
+            self.sweeping, self.next_at = True, None
             try:
-                counts = queue_pending(self.runner, find_pending(client, self.settings))
+                stats: dict = {}
+                pending = find_pending(client, self.settings, stats=stats)
+                self.pending, self.last_stats, self.last_error = pending, stats, ""
+                counts = queue_pending(self.runner, pending)
                 queued = counts.get(Submit.QUEUED, 0)
                 if queued:
                     log.info("sweep: queued %d ticket(s), most urgent first", queued)
@@ -114,5 +133,30 @@ class Sweeper:
                     if counts.get(status):
                         log.warning("sweep: %d ticket(s) not queued: %s", counts[status], status.value)
             except Exception as exc:
+                self.last_error = str(exc)[:300]
                 log.exception("sweep FAILED, will try again in %g min: %s", self.settings.sweep_interval_minutes, exc)
+            self.sweeping, self.last_at = False, time.time()
+            self.next_at = self.last_at + self.settings.sweep_interval_minutes * 60
             time.sleep(self.settings.sweep_interval_minutes * 60)
+
+    def snapshot(self) -> dict:
+        return {
+            "sweeping": self.sweeping,
+            "last_at": self.last_at,
+            "next_at": self.next_at,
+            "last_error": self.last_error,
+            "open": self.last_stats.get("open"),
+            "answered": self.last_stats.get("answered"),
+            "pending": [
+                {
+                    "number": p.number,
+                    "priority": p.priority,
+                    "reason": p.reason,
+                    "short_description": p.short_description,
+                    "opened_at": p.opened_at.timestamp() if p.opened_at else None,
+                }
+                for p in self.pending
+            ],
+            "interval_minutes": self.settings.sweep_interval_minutes,
+            "window_days": self.settings.sweep_window_days,
+        }

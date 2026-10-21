@@ -21,6 +21,7 @@ from ..config import Settings
 from ..ingest.redact import redact
 from ..llm import TcsGenAiLLM
 from ..servicenow.client import ServiceNowClient
+from ..sources.ticket_index import knowledge_source
 from ..store import Store
 from .evidence import FixFinder, FixSearch, HumanNotesOnly, IssueReport, ParallelSearchSource
 from .routing import GroupChooser, GroupDecision, GroupDirectory, PriorityDecision, decide_priority
@@ -57,7 +58,9 @@ def build_services(settings: Settings, *, store: Store | None = None) -> IntakeS
         ServiceNowClient(settings),
         [a for a in settings.intake_agent_note_authors.split(",") if a.strip()],
     )
-    source = ParallelSearchSource(reader, settings, llm, threads=settings.intake_search_threads)
+    source = knowledge_source(
+        settings, ParallelSearchSource(reader, settings, llm, threads=settings.intake_search_threads)
+    )
     writer_client = intake_client(settings)
     # Group and user lookups need more read rights than the ticket agent's
     # account has; the intake account is the one expected to have them.
@@ -330,7 +333,15 @@ class IntakeSession:
         lines = [redact(details).strip(), ""]
         if steps_tried.strip():
             lines += ["Already tried:", redact(steps_tried).strip(), ""]
-        if search.steps:
+        if search.fixed_before:
+            lines.append(f"Fixed before in {', '.join(search.fixed_before[:5])}; the same fix likely applies.")
+            if search.cause:
+                lines.append(f"Cause recorded then: {redact(search.cause)}")
+            if search.steps:
+                lines.append("What the IT team did:")
+                lines += [f"- {s.text} (from {', '.join(s.tickets)})" for s in search.steps]
+            lines.append("")
+        elif search.steps:
             lines.append("Steps suggested by the help desk assistant from past tickets:")
             lines += [f"- {s.text} (from {', '.join(s.tickets)})" for s in search.steps]
             lines.append("")

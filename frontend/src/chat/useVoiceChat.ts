@@ -43,6 +43,10 @@ const MIC_OPTIONS = {
 
 const CONNECT_TIMEOUT_MS = 15_000;
 const AGENT_WAIT_MS = 15_000;
+// LiveKit offers a call to the voice worker only when its room is created, so
+// a call opened while the worker was still loading its models never gets an
+// assistant. Try a fresh room this many times (about two minutes) first.
+const AGENT_RETRIES = 8;
 // A tap shorter than this on the hold-to-talk button is a slip, not speech.
 const MIN_HOLD_MS = 250;
 const PTT_KEY = "sn-agent.pushToTalk";
@@ -211,8 +215,8 @@ export function useVoiceChat(onConversationChanged: () => void) {
     void r.disconnect();
   }, []);
 
-  const connectLiveKit = useCallback(async () => {
-    setStatus("initializing", "Connecting to voice...");
+  const connectLiveKit = useCallback(async (attempt = 0) => {
+    if (attempt === 0) setStatus("initializing", "Connecting to voice...");
     const response = await fetch("/api/livekit/token", { method: "POST" });
     if (!response.ok) throw new Error(`token request failed: ${response.status}`);
     const { url, token } = (await response.json()) as { url: string; token: string };
@@ -283,15 +287,41 @@ export function useVoiceChat(onConversationChanged: () => void) {
     // The assistant joins only calls that start after its voice worker is
     // ready; say so rather than leave the page waiting forever.
     setTimeout(() => {
-      if (room.current === r && !agent.current) {
+      if (room.current !== r || agent.current) return;
+      if (attempt < AGENT_RETRIES) void retryRoom.current(attempt + 1);
+      else {
         setStatus("", "The assistant hasn't joined");
         add(
           "system",
-          "The assistant hasn't joined this call. Check that the voice worker is running, then press New conversation."
+          "The assistant hasn't joined this call. Check that the voice worker (sn-agent voice dev) is running, then press New conversation."
         );
       }
     }, AGENT_WAIT_MS);
   }, [onTranscription, setStatus]);
+
+  // Moves to a fresh room, keeping the microphone as it was.
+  const retryRoom = useRef(async (_attempt: number) => {});
+  retryRoom.current = async (attempt: number) => {
+    const micWas = micOnRef.current;
+    dropRoom();
+    agent.current = null;
+    setMic(false);
+    setMicAudio(null);
+    setStatus("initializing", "The assistant is starting up, one moment...");
+    try {
+      await connectLiveKit(attempt);
+      const r = room.current;
+      if (micWas && r) {
+        await r.localParticipant.setMicrophoneEnabled(true, MIC_OPTIONS);
+        setMic(true);
+        setMicAudio(r.localParticipant.getTrackPublication(Track.Source.Microphone)?.track?.mediaStreamTrack ?? null);
+      }
+    } catch (err) {
+      console.warn("could not reconnect for the assistant:", err);
+      setStatus("", "The assistant hasn't joined");
+      add("system", `Voice couldn't reconnect (${errorText(err)}). Press New conversation to try again.`);
+    }
+  };
 
   // --- text without LiveKit ---------------------------------------------------
 
