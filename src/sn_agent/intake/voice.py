@@ -5,7 +5,9 @@ room gets its own `IntakeSession`, so voice and text share the same tools,
 rules and records as the text-only channel.
 
 Latency, end to end:
-- Silero cuts the audio at a short pause, and that pause ends the turn. (The
+- Silero cuts the audio at a short pause, and that pause ends the turn. In a
+  noisy room, where there is never a pause, the turn ends once the words have
+  stopped changing (see `LiveWhisperSTT`). (The
   model-based turn detector needs LiveKit's cloud or a separate download, and
   on a laptop CPU it added seconds when it was missing.)
 - The reply is drafted and its first sentence synthesized while the turn is
@@ -33,7 +35,9 @@ from livekit.agents import (
     WorkerOptions,
     cli,
     function_tool,
+    room_io,
 )
+from livekit.agents import tts as lk_tts
 from livekit.agents.metrics import EOUMetrics, LLMMetrics, TTSMetrics
 from livekit.plugins import openai as lk_openai
 from livekit.plugins import silero
@@ -42,7 +46,8 @@ from ..config import get_settings
 from ..observability import setup
 from ..recorder import open_store
 from .chat import chat_client, chat_model
-from .local_speech import IT_VOCABULARY, KokoroTTS, LiveWhisperSTT, WhisperSTT
+from .noise_gate import NoiseGate
+from .local_speech import IT_VOCABULARY, ClauseTokenizer, GatewaySTT, KokoroTTS, LiveWhisperSTT, WhisperSTT
 from .prompts import CONVERSATION_STYLE_VOICE, CONVERSATION_SYSTEM, GREETING
 from .session import IntakeSession, build_services
 
@@ -137,12 +142,14 @@ class IntakeVoiceAgent(Agent):
 def _stt(settings, vad_model):
     if settings.stt_provider == "gateway":
         log.info("speech-to-text: %s on the TCS GenAI Lab gateway", settings.stt_gateway_model)
-        return lk_openai.STT(
-            model=settings.stt_gateway_model,
-            client=chat_client(settings),
-            language=settings.stt_language,
-            prompt=IT_VOCABULARY,
-            use_realtime=False,
+        return GatewaySTT(
+            lk_openai.STT(
+                model=settings.stt_gateway_model,
+                client=chat_client(settings),
+                language=settings.stt_language,
+                prompt=IT_VOCABULARY,
+                use_realtime=False,
+            )
         )
     whisper = WhisperSTT(settings.stt_model, device=settings.stt_device, language=settings.stt_language)
     return LiveWhisperSTT(whisper, vad_model, language=settings.stt_language)
@@ -160,8 +167,12 @@ def prewarm(proc: JobProcess) -> None:
         min_silence_duration=0.45, min_speech_duration=0.25, activation_threshold=0.7
     )
     proc.userdata["stt"] = _stt(settings, proc.userdata["vad"])
-    proc.userdata["tts"] = KokoroTTS(
-        settings.tts_model_path, settings.tts_voices_path, voice=settings.tts_voice, speed=settings.tts_speed
+    # Long sentences are spoken clause by clause, so the first words play sooner.
+    proc.userdata["tts"] = lk_tts.StreamAdapter(
+        tts=KokoroTTS(
+            settings.tts_model_path, settings.tts_voices_path, voice=settings.tts_voice, speed=settings.tts_speed
+        ),
+        sentence_tokenizer=ClauseTokenizer(),
     )
     services = build_services(settings, store=open_store(settings))
     services.warm()
@@ -193,12 +204,16 @@ async def entrypoint(ctx: JobContext) -> None:
         tts=ctx.proc.userdata["tts"],
         llm=lk_openai.LLM(model=chat_model(settings), client=chat_client(settings), temperature=0.3),
         turn_handling={
-            "turn_detection": "vad",
+            # "stt": the speech-to-text stream says when the turn ends. It ends
+            # at a pause, like the voice detector, and also when the words stop
+            # though the sound goes on, which in a noisy room it never stops.
+            "turn_detection": "stt" if settings.stt_provider == "local" else "vad",
             "endpointing": {"min_delay": 0.3, "max_delay": 1.5},
             # "vad" here: left to choose, the session picks the adaptive detector,
             # which runs on LiveKit's cloud; without it, talking over the agent
-            # did nothing.
-            "interruption": {"enabled": True, "mode": "vad", "min_duration": 0.6},
+            # did nothing. min_words: background with no words in it can't cut
+            # the reply off; saying anything still does.
+            "interruption": {"enabled": True, "mode": "vad", "min_duration": 0.6, "min_words": 1},
             "preemptive_generation": {"enabled": True, "preemptive_tts": True},
         },
         max_tool_steps=4,
@@ -222,8 +237,12 @@ async def entrypoint(ctx: JobContext) -> None:
         if not speech_id:
             return
         parts = pending.setdefault(speech_id, {})
+        # A reply cut off before it spoke never completes; forget the oldest.
+        while len(pending) > 8:
+            pending.pop(next(iter(pending)))
         if isinstance(metric, EOUMetrics):
             parts["eou"] = metric.end_of_utterance_delay
+            parts["stt"] = metric.transcription_delay
         elif isinstance(metric, LLMMetrics):
             parts["llm"] = metric.ttft
         elif isinstance(metric, TTSMetrics):
@@ -232,8 +251,9 @@ async def entrypoint(ctx: JobContext) -> None:
             total = parts["eou"] + parts["llm"] + parts["tts"]
             intake.record_turn_latency(total)
             log.info(
-                "turn latency %.2fs (end of turn %.2f + first token %.2f + first audio %.2f)",
-                total, parts["eou"], parts["llm"], parts["tts"],
+                "turn latency %.2fs (end of turn %.2f, of which transcription %.2f"
+                " + first token %.2f + first audio %.2f)",
+                total, parts["eou"], parts["stt"], parts["llm"], parts["tts"],
             )
             pending.pop(speech_id, None)
 
@@ -243,7 +263,22 @@ async def entrypoint(ctx: JobContext) -> None:
 
     ctx.add_shutdown_callback(_closed)
     started = time.time()
-    await session.start(agent=IntakeVoiceAgent(intake), room=ctx.room)
+    # Background voices and noise are muted before anything listens.
+    audio_input = room_io.AudioInputOptions(
+        noise_cancellation=(
+            NoiseGate(
+                min_db=settings.noise_gate_min_db,
+                margin_db=settings.noise_gate_margin_db,
+                relative_db=settings.noise_gate_relative_db,
+            )
+            if settings.noise_gate_enabled
+            else None
+        ),
+        auto_gain_control=False,  # boosting a quiet room would lift the background over the gate
+    )
+    await session.start(
+        agent=IntakeVoiceAgent(intake), room=ctx.room, room_options=room_io.RoomOptions(audio_input=audio_input)
+    )
 
     async def _stop_speaking(_data) -> str:
         """The page's Stop button: cut the reply off now, tool call or not."""
@@ -252,6 +287,43 @@ async def entrypoint(ctx: JobContext) -> None:
         return "ok"
 
     ctx.room.local_participant.register_rpc_method("stop_speaking", _stop_speaking)
+
+    # Hold to talk, for noisy rooms: the page switches it on, and then nothing
+    # the microphone picks up is heard except while the button is held.
+    async def _push_to_talk(data) -> str:
+        on = data.payload == "on"
+        automatic = "stt" if settings.stt_provider == "local" else "vad"
+        session.update_options(turn_detection="manual" if on else automatic)
+        session.clear_user_turn()
+        session.input.set_audio_enabled(not on)
+        log.info("conversation %s: hold to talk %s", intake.id, "on" if on else "off")
+        return "ok"
+
+    async def _start_turn(_data) -> str:
+        await session.interrupt(force=True)
+        session.clear_user_turn()
+        session.input.set_audio_enabled(True)
+        return "ok"
+
+    async def _end_turn(_data) -> str:
+        session.input.set_audio_enabled(False)
+        # Whisper finishes the phrase after the call returns; the reply follows.
+        done = session.commit_user_turn(transcript_timeout=10.0, stt_flush_duration=1.0)
+        done.add_done_callback(lambda f: f.cancelled() or f.exception())
+        return "ok"
+
+    async def _cancel_turn(_data) -> str:
+        session.input.set_audio_enabled(False)
+        session.clear_user_turn()
+        return "ok"
+
+    for name, handler in {
+        "set_push_to_talk": _push_to_talk,
+        "start_turn": _start_turn,
+        "end_turn": _end_turn,
+        "cancel_turn": _cancel_turn,
+    }.items():
+        ctx.room.local_participant.register_rpc_method(name, handler)
     session.say(GREETING)
     log.info("session ready in %.1fs", time.time() - started)
 

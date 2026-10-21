@@ -163,3 +163,23 @@ pre.note {
 .bar { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; }
 .bar > span { display: block; height: 100%; background: var(--accent); }
 .empty { padding: 30px; text-align: center; color: var(--muted); }
+
+/* voice level meters */
+.meter { display: inline-flex; align-items: center; gap: 3px; height: 22px; }
+.meter span {
+  width: 4px; height: 100%; border-radius: 2px; background: var(--accent);
+  transform: scaleY(0.12); transform-origin: center; transition: transform 60ms linear;
+}
+.meter.mine span { background: var(--good); }
+.meter.idle span { background: var(--line); }
+.typing { display: inline-flex; gap: 4px; padding: 4px 0; }
+.typing i { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); animation: pulse 1s infinite; }
+.typing i:nth-child(2) { animation-delay: 0.15s; }
+.typing i:nth-child(3) { animation-delay: 0.3s; }
+.mic-wrap { display: flex; align-items: center; gap: 6px; }
+@media (prefers-reduced-motion: reduce) {
+  .meter span { transition: none; }
+  .status-dot, .typing i { animation: none; }
+}
+.ptt { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); cursor: pointer; user-select: none; }
+.mic { touch-action: none; user-select: none; -webkit-user-select: none; }

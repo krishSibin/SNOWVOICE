@@ -220,6 +220,7 @@ class IntakeSession:
             except Exception as exc:  # noqa: BLE001 - the conversation must carry on
                 log.exception("tool %s failed", name)
                 result = {"error": "the tool failed; apologise and offer to raise a ticket", "detail": str(exc)[:200]}
+        log.info("tool %s took %.2fs", name, time.time() - started)
         self.add_event("tool", name=name, arguments=arguments, seconds=round(time.time() - started, 2), result=result)
         self.save()
         return json.dumps(result, default=str)

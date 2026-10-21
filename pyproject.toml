@@ -39,7 +39,7 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.setuptools.package-data]
-sn_agent = ["web/pages/*.html", "web/static/*", "web/static/vendor/*"]
+sn_agent = ["web/ui/*.html", "web/ui/assets/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

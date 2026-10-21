@@ -180,6 +180,17 @@ it with `--node-ip` set to the machine's own IPv4 address (from `ipconfig`):
 the browser sends its audio there, and Chrome will not send it to 127.0.0.1.
 Set `APP_SECRET_KEY` to a long random string.
 
+The web pages are a React app in `frontend/`. Build them once, and again after
+changing anything there (needs Node.js 20 or later):
+
+```bash
+cd frontend && npm install && npm run build      # writes src/sn_agent/web/ui/
+```
+
+While working on the pages, `npm run dev` serves them on
+http://localhost:5173 with live reload and sends API calls to `sn-agent web`
+on port 8080.
+
 Then add the people who can sign in. Employees only ever see the chatbot; `ops`
 users also get the ops console.
 
@@ -278,9 +289,11 @@ src/sn_agent/
   api/          webhook and its in-process worker
   intake/       pre-ticket assistant: fix search, priority and group, incident,
                 text chat, LiveKit voice agent, local speech models
-  web/          web app: sign-in, employee chatbot, ops console
+  web/          web app: sign-in, employee chatbot, ops console;
+                ui/ holds the built React pages
   store.py      SQLite store for users, conversations and agent runs
   recorder.py   records the agent's runs and steps for the console
+frontend/       React source of the web pages (Vite + TypeScript)
 eval/           offline evaluation harness
 servicenow/     instance-side setup and Business Rule
 ```

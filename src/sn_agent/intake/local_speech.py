@@ -21,7 +21,7 @@ from collections import deque
 
 import numpy as np
 from livekit import rtc
-from livekit.agents import APIConnectOptions, stt, tts, utils, vad
+from livekit.agents import APIConnectOptions, stt, tokenize, tts, utils, vad
 from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS, NOT_GIVEN, NotGivenOr
 
 log = logging.getLogger(__name__)
@@ -50,13 +50,46 @@ PHANTOMS = {
 }
 SURE_LOGPROB = -0.4
 SURE_NO_SPEECH = 0.2
+# Whisper's own sign of a loop ("S-S-S-S..." or one phrase over and over):
+# text that compresses this well is not what anyone said.
+MAX_COMPRESSION_RATIO = 2.4
+
+
+def collapse_repeats(text: str, min_words: int = 3) -> str:
+    """Drops a run of words repeated straight after itself, which whisper
+    produces on noisy audio: "it's showing some, it's showing some" keeps one."""
+
+    words = text.split()
+    plain = [re.sub(r"[^\w']", "", w.lower()) for w in words]
+    n = max(min_words, 1)
+    out: list[str] = []
+    out_plain: list[str] = []
+    i = 0
+    while i < len(words):
+        repeated = False
+        for size in range(min(12, len(out_plain)), n - 1, -1):
+            if plain[i : i + size] == out_plain[-size:] and all(plain[i : i + size]):
+                i += size
+                repeated = True
+                break
+        if not repeated:
+            out.append(words[i])
+            out_plain.append(plain[i])
+            i += 1
+    return " ".join(out)
 
 
 def keep_transcript(segments) -> str:
     """The words whisper was confident about, or "" when it was guessing at noise."""
 
-    kept = [s for s in segments if s.no_speech_prob < NO_SPEECH_PROB and s.avg_logprob > MIN_AVG_LOGPROB]
-    text = " ".join(s.text.strip() for s in kept).strip()
+    kept = [
+        s
+        for s in segments
+        if s.no_speech_prob < NO_SPEECH_PROB
+        and s.avg_logprob > MIN_AVG_LOGPROB
+        and getattr(s, "compression_ratio", 0.0) <= MAX_COMPRESSION_RATIO
+    ]
+    text = collapse_repeats(" ".join(s.text.strip() for s in kept).strip())
     # Breath and background noise come back as "..." or "-".
     if not any(c.isalnum() for c in text):
         return ""
@@ -66,6 +99,67 @@ def keep_transcript(segments) -> str:
         if not sure:
             return ""
     return text
+
+
+# What the gateway's whisper returns for noise. It gives no confidences, so
+# only phrases nobody says to a help desk are dropped; "yeah" and "thank you"
+# can be real answers and are kept.
+GATEWAY_PHANTOMS = {
+    "you", "thanks for watching", "thank you for watching", "please subscribe",
+    "subtitles by the amara org community",
+}
+
+
+def clean_gateway_transcript(text: str) -> str:
+    """The gateway's transcript, or "" when it was only noise."""
+
+    text = collapse_repeats((text or "").strip())
+    # Breath and background noise come back as "." or "-".
+    if not any(c.isalnum() for c in text):
+        return ""
+    plain = re.sub(r"[^a-z' ]", "", text.lower()).strip()
+    if plain in GATEWAY_PHANTOMS:
+        return ""
+    # On silence whisper can read its vocabulary prompt back.
+    if plain.startswith("it help desk call"):
+        return ""
+    return text
+
+
+class GatewaySTT(stt.STT):
+    """The gateway's whisper, with what it hears in noise dropped before it
+    can start a turn."""
+
+    def __init__(self, inner: stt.STT):
+        super().__init__(capabilities=stt.STTCapabilities(streaming=False, interim_results=False))
+        self._inner = inner
+
+    @property
+    def model(self) -> str:
+        return self._inner.model
+
+    @property
+    def provider(self) -> str:
+        return self._inner.provider
+
+    async def _recognize_impl(
+        self,
+        buffer: utils.AudioBuffer,
+        *,
+        language: NotGivenOr[str] = NOT_GIVEN,
+        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+    ) -> stt.SpeechEvent:
+        started = time.time()
+        # Retries happen in this wrapper's recognize, not twice over.
+        event = await self._inner.recognize(
+            buffer=buffer, language=language, conn_options=APIConnectOptions(max_retry=0, timeout=conn_options.timeout)
+        )
+        for alt in event.alternatives:
+            heard, alt.text = alt.text, clean_gateway_transcript(alt.text)
+            if heard and not alt.text:
+                log.info("dropped %r from the gateway as noise", heard)
+        log.info("gateway transcribed in %.2fs: %r", time.time() - started, event.alternatives[0].text if event.alternatives else "")
+        return event
 
 
 class WhisperSTT(stt.STT):
@@ -144,6 +238,13 @@ INTERIM_EVERY = 0.4
 INTERIM_MIN_NEW = 0.3
 INTERIM_MAX_PHRASE = 15.0
 PREFIX = 0.5  # audio kept from just before the voice detector fired
+# In a noisy room the sound never stops, so the voice detector never ends the
+# turn. When the words have stopped changing for this long (and this many
+# re-reads in a row), the turn ends on what was said and the rest is treated as
+# the room. Longer than the 0.45 s pause that ends a turn in a quiet room, so a
+# speaker who pauses to think is not cut off.
+STALL_SECONDS = 1.2
+STALL_PASSES = 2
 
 
 def trust_system_certificates() -> None:
@@ -249,8 +350,35 @@ class _LiveWhisperStream(stt.RecognizeStream):
         vad_stream = self._live._vad.stream()
         recent: deque[rtc.AudioFrame] = deque()
         phrase: list[rtc.AudioFrame] = []
-        speaking = False
+        speaking = False  # the voice detector hears sound
         generation = 0  # bumps per phrase, so a late interim can't land on the next one
+        # Ending a turn when the words stop, though the sound goes on (a noisy
+        # room): what has been said, when it last changed, how many re-reads
+        # since, and whether this stretch of sound was already cut into a turn.
+        said = ""
+        said_at = 0.0
+        unchanged = 0
+        in_turn = False  # START_OF_SPEECH sent and no END_OF_SPEECH yet
+        cut = False
+
+        def start_turn() -> None:
+            nonlocal in_turn
+            if not in_turn:
+                in_turn = True
+                self._event_ch.send_nowait(stt.SpeechEvent(type=stt.SpeechEventType.START_OF_SPEECH))
+
+        def end_turn(text: str, end: float) -> None:
+            nonlocal in_turn
+            in_turn = False
+            self._event_ch.send_nowait(stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH, speech_end_time=end))
+            if text:
+                self._event_ch.send_nowait(
+                    stt.SpeechEvent(
+                        type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                        alternatives=[stt.SpeechData(language=self._language, text=text)],
+                        speech_end_time=end,
+                    )
+                )
 
         async def forward_input() -> None:
             async for item in self._input_ch:
@@ -267,32 +395,32 @@ class _LiveWhisperStream(stt.RecognizeStream):
             vad_stream.end_input()
 
         async def follow_vad() -> None:
-            nonlocal speaking, phrase, generation
+            nonlocal speaking, phrase, generation, said, said_at, unchanged, cut
             async for event in vad_stream:
                 if event.type == vad.VADEventType.START_OF_SPEECH:
                     generation += 1
                     phrase = list(recent)
-                    speaking = True
-                    self._event_ch.send_nowait(stt.SpeechEvent(type=stt.SpeechEventType.START_OF_SPEECH))
+                    speaking, cut = True, False
+                    said, said_at, unchanged = "", time.time(), 0
+                    start_turn()
                 elif event.type == vad.VADEventType.END_OF_SPEECH:
                     speaking = False
                     generation += 1
+                    # After a cut, only the sound since then is still unheard.
+                    frames = phrase if cut else event.frames
                     phrase = []
                     end = time.time() - event.silence_duration - event.inference_duration
-                    self._event_ch.send_nowait(
-                        stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH, speech_end_time=end)
-                    )
-                    text = await self._transcribe(event.frames)
-                    if text:
-                        self._event_ch.send_nowait(
-                            stt.SpeechEvent(
-                                type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-                                alternatives=[stt.SpeechData(language=self._language, text=text)],
-                                speech_end_time=end,
-                            )
-                        )
+                    if cut and not in_turn and not frames:
+                        continue
+                    text = await self._transcribe(frames)
+                    if cut and not in_turn:
+                        if not text:
+                            continue  # only background after the cut
+                        start_turn()
+                    end_turn(text, end)
 
         async def interims() -> None:
+            nonlocal phrase, generation, said, said_at, unchanged, cut
             done_up_to = 0.0
             while True:
                 await asyncio.sleep(INTERIM_EVERY)
@@ -300,12 +428,33 @@ class _LiveWhisperStream(stt.RecognizeStream):
                     done_up_to = 0.0
                     continue
                 heard = _seconds(phrase)
-                if heard - done_up_to < INTERIM_MIN_NEW or heard > INTERIM_MAX_PHRASE:
-                    continue
-                done_up_to, this_phrase = heard, generation
-                text = await self._transcribe(list(phrase))
-                if text and speaking and generation == this_phrase:
-                    self._send(stt.SpeechEventType.INTERIM_TRANSCRIPT, text)
+                if heard - done_up_to >= INTERIM_MIN_NEW and heard <= INTERIM_MAX_PHRASE:
+                    done_up_to, this_phrase = heard, generation
+                    text = await self._transcribe(list(phrase))
+                    if not (speaking and generation == this_phrase):
+                        continue
+                    if text and text != said:
+                        said, said_at, unchanged = text, time.time(), 0
+                        start_turn()
+                        self._send(stt.SpeechEventType.INTERIM_TRANSCRIPT, text)
+                        continue
+                    unchanged += 1
+                elif heard > INTERIM_MAX_PHRASE:
+                    unchanged += 1  # too long to re-read: count it as nothing new
+                # Words, then nothing new for a while, yet still sound: the
+                # rest is the room. End the turn on what was said.
+                if (
+                    said
+                    and in_turn
+                    and unchanged >= STALL_PASSES
+                    and time.time() - said_at >= STALL_SECONDS
+                ):
+                    log.info("words stopped but the sound went on; ending the turn on %r", said)
+                    end_turn(said, said_at)
+                    generation += 1
+                    phrase = []
+                    done_up_to = 0.0
+                    said, unchanged, cut = "", 0, True
 
         tasks = [
             asyncio.create_task(forward_input(), name="forward_input"),
@@ -317,6 +466,43 @@ class _LiveWhisperStream(stt.RecognizeStream):
         finally:
             await utils.aio.cancel_and_wait(*tasks)
             await vad_stream.aclose()
+
+
+# Kokoro renders a whole piece before any of it plays, at roughly 0.4 s per
+# second of speech on a laptop CPU, so a long first sentence meant 2 s or more
+# of silence. A long sentence is cut at a comma or semicolon into pieces of at
+# least this many characters; the first plays while the next is rendered.
+MIN_CLAUSE = 25
+CLAUSE_BREAK = re.compile(r"[,;:](?=\s)")
+
+
+def split_clauses(sentence: str, min_len: int = MIN_CLAUSE) -> list[str]:
+    """A sentence cut at commas into pieces no shorter than `min_len`."""
+
+    pieces: list[str] = []
+    start = 0
+    for match in CLAUSE_BREAK.finditer(sentence):
+        cut = match.end()
+        if cut - start >= min_len and len(sentence) - cut >= min_len:
+            pieces.append(sentence[start:cut].strip())
+            start = cut
+    pieces.append(sentence[start:].strip())
+    return [p for p in pieces if p]
+
+
+class ClauseTokenizer(tokenize.SentenceTokenizer):
+    """Sentences, as LiveKit splits them, with long ones cut into clauses."""
+
+    def __init__(self, min_len: int = MIN_CLAUSE):
+        self._sentences = tokenize.blingfire.SentenceTokenizer(retain_format=True)
+        self._min_len = min_len
+
+    def tokenize(self, text: str, *, language: str | None = None) -> list[str]:
+        return [p for s in self._sentences.tokenize(text) for p in split_clauses(s.strip(), self._min_len)]
+
+    def stream(self, *, language: str | None = None) -> tokenize.SentenceStream:
+        # Each piece is an exact slice of the text, so the stream can find it.
+        return tokenize.BufferedSentenceStream(tokenizer=self.tokenize, min_token_len=self._min_len, min_ctx_len=10)
 
 
 class KokoroTTS(tts.TTS):

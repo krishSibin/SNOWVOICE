@@ -151,6 +151,12 @@ class Settings(BaseSettings):
     tts_voices_path: str = "models/voices-v1.0.bin"
     tts_voice: str = "af_heart"
     tts_speed: float = 1.05
+    # Mutes microphone audio that is not clearly louder than the room, so
+    # voices across the room and background noise are never heard as speech.
+    noise_gate_enabled: bool = True
+    noise_gate_min_db: float = -45.0  # audio quieter than this never counts
+    noise_gate_margin_db: float = 12.0  # how far above the room's background speech must be
+    noise_gate_relative_db: float = 15.0  # mute what is this far below the caller's own voice
 
     # Queue and sweep. ServiceNow is the queue: the sweep asks it which open
     # tickets still lack an agent note, and workers take them most urgent first.

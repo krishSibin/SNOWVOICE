@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from ..config import Settings, get_settings
@@ -31,7 +31,8 @@ from .auth import COOKIE, SESSION_SECONDS, Identity, Signer, check_password
 log = logging.getLogger(__name__)
 
 HERE = Path(__file__).resolve().parent
-PAGES = HERE / "pages"
+# The React pages, built from frontend/ by `npm run build`.
+UI = HERE / "ui"
 CHAT_IDLE_SECONDS = 30 * 60
 
 
@@ -61,7 +62,17 @@ def configure(settings: Settings, *, store: Store | None = None, services: Any =
 
 
 app = FastAPI(title="ServiceNow Agent", lifespan=lifespan)
-app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
+app.mount("/assets", StaticFiles(directory=UI / "assets", check_dir=False), name="assets")
+
+
+def _page(name: str):
+    page = UI / f"{name}.html"
+    if not page.exists():
+        return PlainTextResponse(
+            "The web pages are not built yet. Run: cd frontend && npm install && npm run build",
+            status_code=503,
+        )
+    return FileResponse(page)
 
 
 # --- identity ---------------------------------------------------------------
@@ -98,7 +109,7 @@ def home(request: Request):
 
 @app.get("/login")
 def login_page():
-    return FileResponse(PAGES / "login.html")
+    return _page("login")
 
 
 @app.post("/login")
@@ -126,7 +137,7 @@ def logout():
 def chat_page(request: Request):
     if current(request) is None:
         return RedirectResponse("/login", status_code=303)
-    return FileResponse(PAGES / "chat.html")
+    return _page("chat")
 
 
 @app.get("/ops")
@@ -136,7 +147,7 @@ def ops_page(request: Request):
         return RedirectResponse("/login", status_code=303)
     if not identity.is_ops:
         return RedirectResponse("/chat", status_code=303)
-    return FileResponse(PAGES / "ops.html")
+    return _page("ops")
 
 
 @app.get("/api/me")
